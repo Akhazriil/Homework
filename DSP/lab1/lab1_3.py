@@ -1,290 +1,318 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import time
+from scipy.linalg import sqrtm
 
-class RBPF_Dipole_Optimized:
+class RBPF:
+    """
+    Исправленная версия RBPF с правильным масштабированием
+    """
     def __init__(self, n_particles, sensors, mu0=4*np.pi*1e-7,
-                 lambda_pos=1.0, delta_mom=0.25, 
-                 R_noise=None, Q_pos=None, Q_mom=None):
+                 lambda_pos=1.0, delta_mom=0.25, snr_db=20):
         self.N = n_particles
-        self.sensors = np.array(sensors, dtype=np.float64)
+        self.sensors = np.asarray(sensors, dtype=np.float64)
         self.L = len(sensors)
         self.mu0 = mu0
-        self.lambda_pos = lambda_pos
-        self.delta_mom = delta_mom
         
-        self.R = R_noise if R_noise is not None else 0.2 * np.eye(self.L, dtype=np.float64)
-        self.Q_pos = Q_pos if Q_pos is not None else (lambda_pos**2) * np.eye(2, dtype=np.float64)
-        self.Q_mom = Q_mom if Q_mom is not None else (delta_mom**2) * np.eye(2, dtype=np.float64)
+        # Параметры случайного блуждания из задания 3: x_{k+1} = x_k + w_{k+1}
+        # Q_p и Q_q - матрицы ковариаций шума процесса для позиции и момента диполя
+        self.Q_p = (lambda_pos**2) * np.eye(2, dtype=np.float64)
+        self.Q_q = (delta_mom**2) * np.eye(2, dtype=np.float64)
         
-        self.particles = None
+        # SNR-based шум: задаём уровень доверия к измерениям заранее
+        self.snr_db = snr_db
+        self.R = None
+        self.inv_R = None
+        
+        # Хранилище частиц: позиция берётся в фильтр частиц, а момент оценивается аналитически (теорема Рао-Блэкуэлла)
+        self.particles_p = None
         self.q_mean = None
         self.q_cov = None
         self.weights = None
+
+    def compute_measurements(self, p, q):
+        """Вычисление магнитного поля (векторизовано)"""
+        # Разности координат: вектор от диполя до каждого сенсора
+        dx = self.sensors[np.newaxis, :, 0] - p[:, 0:1]
+        dy = self.sensors[np.newaxis, :, 1] - p[:, 1:2]
+        dz = self.sensors[np.newaxis, :, 2]
         
-    def _compute_G_vectorized(self, particles):
-        """Even more vectorized version"""
-        N = particles.shape[0]
-        diff = self.sensors[np.newaxis, :, :] - particles[:, np.newaxis, :]
+        # Расстояния до куба для знаменателя
+        r2 = dx**2 + dy**2 + dz**2
+        r3 = np.power(r2, 1.5) + 1e-12
         
-        # Add small epsilon for numerical stability
-        d2 = np.sum(diff**2, axis=2)
-        d3 = np.power(d2 + 1e-10, 1.5)
+        # Формула Био-Савара для перпендикулярной компоненты поля.
+        # Модель линейна относительно q, что позволяет разделить оценку позиции и момента
+        factor = self.mu0 / (4.0 * np.pi)
+        B = factor * (q[:, 0:1] * dy - q[:, 1:2] * dx) / r3
         
-        # Vectorized cross product
-        G = np.zeros((N, self.L, 2))
-        G[:, :, 0] = -diff[:, :, 1]
-        G[:, :, 1] = diff[:, :, 0]
-        
-        return (self.mu0 / (4*np.pi)) * G / d3[:, :, np.newaxis]
-    
-    def initialize(self, p_mean, p_cov, q_mean, q_cov):
-        """Инициализация фильтра"""
-        self.particles = np.random.multivariate_normal(
-            np.array(p_mean, dtype=np.float64), 
-            np.array(p_cov, dtype=np.float64), 
-            self.N
-        )
-        
-        # Создаём массивы формы (N, 2) и (N, 2, 2)
-        q_mean_arr = np.array(q_mean, dtype=np.float64).reshape(2)
-        q_cov_arr = np.array(q_cov, dtype=np.float64).reshape(2, 2)
-        
-        self.q_mean = np.empty((self.N, 2), dtype=np.float64)
-        self.q_cov = np.empty((self.N, 2, 2), dtype=np.float64)
-        
-        for n in range(self.N):
-            self.q_mean[n] = q_mean_arr.copy()
-            self.q_cov[n] = q_cov_arr.copy()
-        
+        return B.squeeze()
+
+    def initialize_with_snr(self, p_mean, p_cov, q_mean, q_cov, y_first):
+        """
+        Инициализация с автоматическим определением шума на основе SNR
+        """
+        # Генерируем начальный набор частиц позиции из априорного распределения
+        self.particles_p = np.random.multivariate_normal(p_mean, p_cov, self.N)
+        # Для каждой частицы заводим отдельные параметры фильтра Калмана для момента
+        self.q_mean = np.tile(q_mean, (self.N, 1))
+        self.q_cov = np.tile(q_cov[np.newaxis, :, :], (self.N, 1, 1))
         self.weights = np.ones(self.N, dtype=np.float64) / self.N
         
+        # Оценка уровня сигнала для определения шума
+        # Используем первую частицу для примерной оценки
+        B_est = self.compute_measurements(self.particles_p[:1], self.q_mean[:1])
+        signal_power = np.mean(B_est**2)
+        
+        # Устанавливаем ковариацию шума наблюдения R исходя из заданного SNR
+        noise_power = signal_power / (10**(self.snr_db/10))
+        noise_std = np.sqrt(noise_power)
+        
+        self.R = noise_std**2 * np.eye(self.L, dtype=np.float64)
+        self.inv_R = 1.0 / noise_std**2
+        
+        return self.R
+
     def predict(self):
-        """Шаг предсказания"""
-        self.particles += np.random.multivariate_normal(
-            np.zeros(2, dtype=np.float64), 
-            self.Q_pos, 
-            self.N
+        """Шаг предсказания (разнесение частиц и прогноз Калмана)"""
+        # Случайное блуждание позиции: добавляем шум процесса к каждой частице
+        self.particles_p += np.random.multivariate_normal(
+            np.zeros(2), self.Q_p, self.N
         )
-        # Add mean prediction with random walk
+        # Случайное блуждание момента: сдвигаем среднее значение Калмана
         self.q_mean += np.random.multivariate_normal(
-            np.zeros(2, dtype=np.float64),
-            self.Q_mom,
-            self.N
+            np.zeros(2), self.Q_q, self.N
         )
-        self.q_cov += self.Q_mom
-        
+        # Прогноз ковариации момента по формуле Калмана: P_{k|k-1} = P_{k-1|k-1} + Q_q
+        self.q_cov += self.Q_q[np.newaxis, :, :]
+
     def update(self, y):
-        """Векторизованный шаг обновления"""
-        y = np.array(y, dtype=np.float64).flatten()
-        log_weights = np.zeros(self.N, dtype=np.float64)
+        """Шаг коррекции с использованием информационного фильтра"""
+        y = np.asarray(y, dtype=np.float64).flatten()
+        p = self.particles_p
         
-        G_all = self._compute_G_vectorized(self.particles)
+        # 1. Вычисление матрицы чувствительности G (lead field matrix)
+        # Показывает, как изменение момента q влияет на показания сенсоров при фиксированной позиции
+        dx = self.sensors[np.newaxis, :, 0] - p[:, 0:1]
+        dy = self.sensors[np.newaxis, :, 1] - p[:, 1:2]
+        dz = self.sensors[np.newaxis, :, 2]
+        r2 = dx**2 + dy**2 + dz**2
+        r3 = np.power(r2, 1.5) + 1e-12
+        factor = self.mu0 / (4.0 * np.pi)
         
-        for n in range(self.N):
-            G = G_all[n]
-            
-            y_pred = G @ self.q_mean[n]
-            nu = y - y_pred
-            
-            S = G @ self.q_cov[n] @ G.T + self.R
-            S_inv = np.linalg.inv(S)
-            K = self.q_cov[n] @ G.T @ S_inv
-            
-            self.q_mean[n] += K @ nu
-            self.q_cov[n] = (np.eye(2, dtype=np.float64) - K @ G) @ self.q_cov[n]
-            
-            sign, logdet = np.linalg.slogdet(S)
-            log_weights[n] = -0.5 * (nu.T @ S_inv @ nu + logdet)
+        G = np.empty((self.N, self.L, 2), dtype=np.float64)
+        G[:, :, 0] = factor * dy / r3  # ∂B/∂q_x
+        G[:, :, 1] = -factor * dx / r3  # ∂B/∂q_y
         
-        log_weights += np.log(self.weights + 1e-300)
+        # 2. Предсказанные измерения и вектор инноваций (разница между реальным и предсказанным)
+        y_pred = np.einsum('nij,nj->ni', G, self.q_mean)
+        innov = y[np.newaxis, :] - y_pred
+        
+        # 3. Информационная форма Калмана для q (обновляем обратную ковариацию, это численно стабильнее)
+        GtG = np.einsum('nli,nlj->nij', G, G)
+        
+        # Апостериорная ковариация q: J_new = J_prior + G^T R^{-1} G
+        inv_prior = np.linalg.inv(self.q_cov)
+        A = inv_prior + self.inv_R * GtG
+        P_new = np.linalg.inv(A)
+        
+        # 4. Вычисление правдоподобия для весов частиц
+        # Аналитически исключаем q из апостериорного распределения (суть теоремы Рао-Блэкуэлла)
+        # Считаем логарифм правдоподобия, чтобы избежать переполнения при перемножении вероятностей
+        v = innov * self.inv_R
+        vG = np.einsum('nl,nli->ni', v, G)
+        
+        # Квадратичная форма в экспоненте гауссовского распределения
+        quad = np.einsum('ni,nij,nj->n', vG, P_new, vG)
+        
+        # Логарифмический определитель ковариации инноваций через матричное тождество
+        det_term = np.eye(2)[np.newaxis, :, :] + self.inv_R * (self.q_cov @ GtG)
+        sign, logdet_det_term = np.linalg.slogdet(det_term)
+        logdet_S = self.L * np.log(1.0/self.inv_R) + logdet_det_term
+        
+        # Итоговый логарифм правдоподобия
+        log_likelihood = -0.5 * (self.inv_R * np.sum(innov**2, axis=1) - quad + logdet_S)
+        
+        # Обновление весов по формуле Байеса и нормировка
+        log_weights = log_likelihood + np.log(self.weights + 1e-300)
         log_weights -= np.max(log_weights)
         self.weights = np.exp(log_weights)
-        self.weights /= np.sum(self.weights)
+        self.weights /= np.sum(self.weights + 1e-300)
         
-    def resample(self, threshold=None):
-        """Систематический ресемплинг с адаптивным порогом"""
-        if threshold is None:
-            threshold = self.N / 2
-        
-        ESS = 1.0 / np.sum(self.weights**2)
-        if ESS < threshold:
-            # Systematic resampling as before
+        # Обновление моментов q с учётом полученных измерений (шаг коррекции Калмана)
+        self.q_mean += np.einsum('nij,nj->ni', P_new, vG)
+        self.q_cov = P_new
+
+    def resample(self, threshold_ratio=0.5):
+        """Ресэмплинг при малом ESS (борьба с вырождением частиц)"""
+        # Считаем эффективное количество частиц
+        ess = 1.0 / np.sum(self.weights**2)
+        if ess < threshold_ratio * self.N:
+            # Если частиц осталось мало, делаем систематический ресэмплинг
             indices = self._systematic_resample()
-            
-            self.particles = self.particles[indices].copy()
-            self.q_mean = self.q_mean[indices].copy()
-            self.q_cov = self.q_cov[indices].copy()
-            self.weights = np.ones(self.N) / self.N
-            
-        return ESS
+            self.particles_p = self.particles_p[indices]
+            self.q_mean = self.q_mean[indices]
+            self.q_cov = self.q_cov[indices]
+            self.weights.fill(1.0 / self.N)
+        return ess
 
     def _systematic_resample(self):
-        """Separate resampling logic"""
-        indices = np.zeros(self.N, dtype=int)
-        positions = (np.arange(self.N) + np.random.rand()) / self.N
-        cumsum = np.cumsum(self.weights)
-        i, j = 0, 0
-        while i < self.N:
-            if positions[i] < cumsum[j]:
-                indices[i] = j
-                i += 1
-            else:
-                j += 1
-        return indices
+        """Систематический ресэмплинг"""
+        u = (np.arange(self.N) + np.random.random()) / self.N
+        cs = np.cumsum(self.weights)
+        indices = np.searchsorted(cs, u)
+        return np.clip(indices, 0, self.N - 1)
 
-    def estimate(self):
-        """Возвращает взвешенную оценку состояния"""
-        p_est = np.average(self.particles, weights=self.weights, axis=0)
+    def get_estimate(self):
+        """Получение взвешенной оценки состояния"""
+        # Условное матожидание апостериорного распределения: сумма частиц, умноженных на их веса
+        p_est = np.average(self.particles_p, weights=self.weights, axis=0)
         q_est = np.average(self.q_mean, weights=self.weights, axis=0)
-
-        # Простое преобразование без ravel()
-        p_est = np.asarray(p_est, dtype=np.float64)
-        q_est = np.asarray(q_est, dtype=np.float64)
-
         return p_est, q_est
+    
 
-
-# === ГЕНЕРАЦИЯ ДАННЫХ ===
-def generate_synthetic_data(T, sensors, true_params, 
-                           lambda_pos=1.0, delta_mom=0.25, 
-                           R_noise_std=0.2, seed=None):
-    if seed is not None:
-        np.random.seed(seed)
-    # Пусть имеется L сенсоров(10)
+def generate_realistic_data(T, sensors, true_trajectory, noise_std_scale=0.01):
+    """
+    Генерация синтетических данных для проверки работы фильтра
+    """
     L = len(sensors)
-    # Задание магнитной постоянной
-    mu0 = 4*np.pi*1e-7
+    mu0 = 4 * np.pi * 1e-7
+    factor = mu0 / (4 * np.pi)
     
-    p_true = np.zeros((T, 2), dtype=np.float64)
-    q_true = np.zeros((T, 2), dtype=np.float64)
-    y_obs = np.zeros((T, L), dtype=np.float64)
+    p_true = np.zeros((T, 2))
+    q_true = np.zeros((T, 2))
+    y_clean = np.zeros((T, L))
     
-    p_true[0] = true_params['p_init']
-    q_true[0] = true_params['q_init']
-    
-    def compute_b(p, q):
-        # единичный вектор перпендикулярный плоскости P
-        e = np.array([0, 0, 1], dtype=np.float64)
-        # Вектор наблюдений
-        b = np.zeros(L, dtype=np.float64)
-
-        for j, rj in enumerate(sensors):
-            rj_vec = np.array([rj[0], rj[1], rj[2]], dtype=np.float64)
-            p_vec = np.array([p[0], p[1], 0], dtype=np.float64)
-            q_vec = np.array([q[0], q[1], 0], dtype=np.float64)
-            diff = rj_vec - p_vec
-            d3 = np.linalg.norm(diff)**3
-            b[j] = (mu0/(4*np.pi)) * np.dot(e, np.cross(q_vec, diff )) / d3
-        return b
-    
-    for k in range(1, T):
-        p_true[k] = p_true[k-1] + np.random.normal(0, lambda_pos, 2)
-        q_true[k] = q_true[k-1] + np.random.normal(0, delta_mom, 2)
+    # Истинная траектория (движение по кругу) и вращение момента
+    for k in range(T):
+        t = k / T * 2 * np.pi
+        p_true[k] = true_trajectory['center'] + true_trajectory['radius'] * np.array([np.cos(t), np.sin(t)])
         
-        b_clean = compute_b(p_true[k], q_true[k])
-        y_obs[k] = b_clean + np.random.normal(0, R_noise_std, L)
+        # Дипольный момент (вращается)
+        q_true[k] = true_trajectory['q_amplitude'] * np.array([np.cos(t), np.sin(t)])
+        
+        # Вычисление чистого магнитного поля по закону Био-Савара без шума
+        for i, (px, py) in enumerate([p_true[k]]):
+            dx = sensors[:, 0] - px
+            dy = sensors[:, 1] - py
+            dz = sensors[:, 2]
+            r3 = (dx**2 + dy**2 + dz**2)**1.5 + 1e-12
+            y_clean[k] = factor * (q_true[k, 0] * dy - q_true[k, 1] * dx) / r3
     
-    y_obs[0] = compute_b(p_true[0], q_true[0]) + np.random.normal(0, R_noise_std, L)
+    # Оценка уровня шума на основе амплитуды сигнала
+    signal_std = np.std(y_clean)
+    noise_std = noise_std_scale * signal_std
     
-    return p_true, q_true, y_obs
+    # Добавление аддитивного белого гауссовского шума
+    y_noisy = y_clean + np.random.normal(0, noise_std, (T, L))
+    
+    return p_true, q_true, y_clean, y_noisy, noise_std
 
 
-# === ЗАПУСК ===
-T = 50
-L = 100
-sensors = np.mgrid[0:10:10j, 0:10:10j, 3:4].reshape(3, -1).T
+T = 100  # Временных шагов
+L = 25   # Сенсоров (5x5 сетка)
 
-true_params = {
-    'p_init': np.array([5.0, 5.0], dtype=np.float64),
-    'q_init': np.array([1.0, 0.5], dtype=np.float64),
+# Создание сенсоров на высоте 3 единицы
+x = np.linspace(-10, 10, 5)
+y = np.linspace(-10, 10, 5)
+xx, yy = np.meshgrid(x, y)
+sensors = np.column_stack([xx.ravel(), yy.ravel(), np.ones(25) * 3])
+
+# Истинная траектория
+true_trajectory = {
+    'center': np.array([0.0, 0.0]),
+    'radius': 5.0,
+    'q_amplitude': 1000.0  # Дипольный момент (в единицах A·м)
 }
 
-p_true, q_true, y_data = generate_synthetic_data(
-    T, sensors, true_params, 
-    lambda_pos=0.5, delta_mom=0.1, R_noise_std=0.2, seed=42)
+p_true, q_true, y_clean, y_noisy, noise_std = generate_realistic_data(
+    T, sensors, true_trajectory, noise_std_scale=0.05
+)
 
-start_time = time.time()
-
-rbpf = RBPF_Dipole_Optimized(
-    n_particles=1000,
+# Инициализация фильтра
+rbpf = RBPF(
+    n_particles=2000,
     sensors=sensors,
-    lambda_pos=1.0,
-    delta_mom=0.25,
-    R_noise=0.2**2 * np.eye(L, dtype=np.float64)
+    lambda_pos=0.5,
+    delta_mom=50.0,  # Увеличен для соответствия амплитуде
+    snr_db=20
 )
 
-rbpf.initialize(
-    p_mean=np.array([5.0, 5.0], dtype=np.float64), 
-    p_cov=np.diag(np.array([25.0, 25.0], dtype=np.float64)),
-    q_mean=np.array([0.0, 0.0], dtype=np.float64), 
-    q_cov=np.diag(np.array([4.0, 4.0], dtype=np.float64))
+# Инициализация с первым измерением для оценки SNR и расстановки частиц
+rbpf.initialize_with_snr(
+    p_mean=np.array([0.0, 0.0]),
+    p_cov=np.diag([100.0, 100.0]),
+    q_mean=np.array([500.0, 0.0]),
+    q_cov=np.diag([10000.0, 10000.0]),
+    y_first=y_noisy[0]
 )
 
-# ИСПРАВЛЕНИЕ: Используем списки вместо предвыделенных массивов
-p_est_list = []
-q_est_list = []
-ess_log = np.zeros(T, dtype=np.float64)
+# Фильтрация
+p_est = []
+q_est = []
+ess_history = []
 
 for k in range(T):
     if k > 0:
         rbpf.predict()
-    rbpf.update(y_data[k])
-    ess_log[k] = rbpf.resample()
-    p_k, q_k = rbpf.estimate()
-    
-    # Добавляем в список (как в рабочем коде)
-    p_est_list.append(p_k)
-    q_est_list.append(q_k)
+    rbpf.update(y_noisy[k])
+    ess = rbpf.resample()
+    p_k, q_k = rbpf.get_estimate()
+    p_est.append(p_k)
+    q_est.append(q_k)
+    ess_history.append(ess)
 
-# Конвертируем в массивы в конце
-p_est = np.array(p_est_list, dtype=np.float64)
-q_est = np.array(q_est_list, dtype=np.float64)
+p_est = np.array(p_est)
+q_est = np.array(q_est)
 
-elapsed_time = time.time() - start_time
-print(f"Время выполнения: {elapsed_time:.2f} секунд")
-print(f"Форма p_est: {p_est.shape}")
-print(f"Форма q_est: {q_est.shape}")
-print(f"q_est[:, 1] shape: {q_est[:, 1].shape}")  # Должно быть (50,)
 
-# === ВИЗУАЛИЗАЦИЯ ===
-fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+# 1. График траектории
+plt.figure(figsize=(10, 8))
 
-ax = axes[0, 0]
-ax.plot(p_true[:, 0], p_true[:, 1], 'g-', label='True', linewidth=2)
-ax.plot(p_est[:, 0], p_est[:, 1], 'r--', label='RBPF estimate', linewidth=1.5)
-ax.scatter(sensors[:, 0], sensors[:, 1], c='gray', s=10, alpha=0.3, label='Sensors')
-ax.set_xlabel('p₁'); ax.set_ylabel('p₂')
-ax.set_title('Dipole Position Tracking'); ax.legend(); ax.grid(True)
+# Основной график траектории
+plt.subplot(2, 2, 1)
+plt.plot(p_true[:, 0], p_true[:, 1], 'g-', linewidth=2, label='Истинная траектория')
+plt.plot(p_est[:, 0], p_est[:, 1], 'r--', linewidth=2, label='Оценка RBPF')
+plt.scatter(sensors[:, 0], sensors[:, 1], c='blue', marker='s', s=30, alpha=0.5, label='Сенсоры')
+plt.scatter(p_true[0, 0], p_true[0, 1], c='green', marker='o', s=100, label='Старт')
+plt.scatter(p_true[-1, 0], p_true[-1, 1], c='red', marker='*', s=150, label='Финиш')
+plt.xlabel('X координата')
+plt.ylabel('Y координата')
+plt.title('Траектория движения диполя')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.axis('equal')
 
-ax = axes[0, 1]
-# Исправление: объединяем все линии в одном вызове plot
-ax.plot(q_true[:, 0], 'g-', label='True q₁', linewidth=2)
-ax.plot(q_true[:, 1], 'g--', label='True q₂', linewidth=2)
-ax.plot(q_est[:, 0], 'r-', label='Est q₁', linewidth=1.5)
-ax.plot(q_est[:, 1], 'r--', label='Est q₂', linewidth=1.5)
-ax.set_xlabel('Time step')
-ax.set_ylabel('Moment')
-ax.set_title('Dipole Moment Estimation')
-ax.legend()
-ax.grid(True)
+# 2. Ошибка позиции
+plt.subplot(2, 2, 2)
+position_error = np.sqrt(np.sum((p_true - p_est)**2, axis=1))
+plt.plot(position_error, 'b-', linewidth=2)
+plt.fill_between(range(len(position_error)), 0, position_error, alpha=0.3)
+plt.xlabel('Временной шаг')
+plt.ylabel('Ошибка позиции')
+plt.title(f'Ошибка оценки позиции (ср.: {np.mean(position_error):.3f})')
+plt.grid(True, alpha=0.3)
 
-ax = axes[1, 0]
-error_p = np.linalg.norm(p_true - p_est, axis=1)
-ax.plot(error_p, color='purple')
-ax.set_xlabel('Time step')
-ax.set_ylabel('Position error')
-ax.set_title('Tracking Error')
-ax.grid(True)
+# 3. Дипольный момент
+plt.subplot(2, 2, 3)
+plt.plot(q_true[:, 0], 'g-', label='Истинный q_x', linewidth=2)
+plt.plot(q_est[:, 0], 'r--', label='Оценка q_x', linewidth=2, alpha=0.7)
+plt.plot(q_true[:, 1], 'b-', label='Истинный q_y', linewidth=2)
+plt.plot(q_est[:, 1], 'orange', linestyle='--', label='Оценка q_y', linewidth=2, alpha=0.7)
+plt.xlabel('Временной шаг')
+plt.ylabel('Дипольный момент')
+plt.title('Компоненты дипольного момента')
+plt.legend()
+plt.grid(True, alpha=0.3)
 
-ax = axes[1, 1]
-ax.plot(ess_log, color='brown')
-ax.axhline(y=1000/2, color='red', linestyle=':', label='Threshold')
-ax.set_xlabel('Time step')
-ax.set_ylabel('Effective Sample Size')
-ax.set_title('Particle Filter Diagnostics')
-ax.legend()
-ax.grid(True)
+# 4. Ошибка дипольного момента
+plt.subplot(2, 2, 4)
+moment_error = np.sqrt(np.sum((q_true - q_est)**2, axis=1))
+plt.plot(moment_error, 'r-', linewidth=2)
+plt.fill_between(range(len(moment_error)), 0, moment_error, alpha=0.3)
+plt.xlabel('Временной шаг')
+plt.ylabel('Ошибка момента')
+plt.title(f'Ошибка дипольного момента (ср.: {np.mean(moment_error):.2f})')
+plt.grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.show()
