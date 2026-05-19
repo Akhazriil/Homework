@@ -1,3 +1,6 @@
 *.wav
 data/
 data_img/
+footprints/
+lab13/
+weights/
