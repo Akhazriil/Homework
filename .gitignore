@@ -1,3 +1,5 @@
 *.wav
 data/
 data_img/
+footprints/
+classification_results.csv
