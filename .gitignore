@@ -2,4 +2,8 @@
 data/
 data_img/
 footprints/
-classification_results.csv
+lab13/
+weights/
+fhd_yolo-footprints/
+footprints/
+runs/
