@@ -4,6 +4,12 @@ data_img/
 footprints/
 lab13/
 weights/
-fhd_yolo-footprints/
-footprints/
+*.keras
+*.pt
+*.rar
+result_12/
+result_13/
 runs/
+result_14/
+fhd_yolo-footprints/
+lab14_results/
