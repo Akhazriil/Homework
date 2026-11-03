@@ -1,6 +1,6 @@
 %% Задание 4: полёт шара
 clear; clc; close all;
-cd('C:\Users\reino\Documents\MATLAB')
+cd('C:\Users\reino\Desktop\Учеба\Homework\arch')
 
 alpha_deg = 30;                      % угол в градусах
 v0 = 10;

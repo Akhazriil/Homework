@@ -1,0 +1,5 @@
+tensorflow>=2.16
+pymorphy3
+numpy
+scikit-learn
+matplotlib
