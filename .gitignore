@@ -16,3 +16,6 @@ lab14_results/
 videos/
 resources/
 venv/
+cache*/
+models_smoke/
+models_syntagrus/
